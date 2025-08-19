@@ -1,0 +1,126 @@
+name: AutoSyncMirrorFork
+on:
+  schedule:
+    - cron: '45 3 * * *'
+  workflow_dispatch:
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+            token: ${{secrets.GH_TOKEN}}
+      - name: KeepAlive
+        run: |
+          date "+%Y-%m-%d %H:%M:%S" > timestamp
+          git config user.name ${{github.repository_owner}}
+          git config user.email ${{github.repository_owner}}@users.noreply.github.com
+          git remote set-url origin https://${{secrets.GH_TOKEN}}@github.com/${{github.repository}}.git
+          git add timestamp
+          git commit -m "Update"
+          git push origin ${{github.ref_name}}
+      - name: AutoSync
+        env:
+          GH_TOKEN: ${{secrets.GH_TOKEN}}
+          GH_USER: ${{github.repository_owner}}
+        run: |
+          set -e -o pipefail
+          GLOBAL_SYNC_FAILED=false
+          WHITELIST=$(cat whitelist.json)
+          echo "Fetching forked repositories"
+          gh api --paginate users/$GH_USER/repos --jq ".[] | select(.fork==true and .disabled==false)" | \
+          while read -r repo_json; do
+            fork_repo=$(echo "$repo_json" | jq -r ".full_name")
+            fork_name=$(echo "$repo_json" | jq -r ".name")
+            whitelist_branches=$(echo "$WHITELIST" | jq -r --arg fork_name "$fork_name" ".[\"$fork_name\"]")
+            if [[ "$whitelist_branches" == "[]" ]]; then
+              echo "$fork_repo : Skipped due to whitelist rule (empty list)."
+              continue
+            fi
+            fork_url=$(echo "$repo_json" | jq -r ".html_url")
+            echo "fork_url : $fork_url"
+            fork_branches=$(gh api --paginate "repos/$fork_repo/branches" --jq ".[].name" || echo "FETCH_BRANCHES_FAILED")
+            if [[ "$fork_branches" == "FETCH_BRANCHES_FAILED" ]] || [[ -z "$fork_branches" ]]; then
+              echo "$fork_repo : Could not fetch branches or no branches found."
+              exit 1
+            fi
+            upstream_repo=$(gh api --paginate "repos/$fork_repo" --jq ".parent.full_name")
+            echo "$fork_repo : upstream_repo : $upstream_repo"
+            upstream_url="https://github.com/$upstream_repo"
+            echo "$fork_repo : upstream_url : $upstream_url"
+            upstream_branches=$(gh api --paginate "repos/$upstream_repo/branches" --jq ".[].name" || echo "FETCH_BRANCHES_FAILED")
+            if [[ "$upstream_branches" == "FETCH_BRANCHES_FAILED" ]] || [[ -z "$upstream_branches" ]]; then
+              echo "::error::$fork_repo : Could not fetch branches or no branches found. Skipping API sync."
+              GLOBAL_SYNC_FAILED=true
+              continue
+            fi
+            sync_failed=false
+            for branch in $upstream_branches; do
+              echo "$fork_repo : branch : $branch"
+              is_whitelisted=$(echo "$whitelist_branches" | jq --arg branch "$branch" "(. // []) | any(.==\"$branch\")")
+              if [[ "$is_whitelisted" == "true" ]]; then
+                echo "$fork_repo : Skipping branch '$branch' due to whitelist rule."
+                continue
+              fi
+              if ! gh api --method POST "repos/$fork_repo/merge-upstream" -f branch="$branch" --silent; then
+                echo "::error::$fork_repo : API sync failed for branch '$branch'. A fallback to Git force push is required."
+                sync_failed=true
+                break
+              fi
+            done
+            if [ "$sync_failed" = false ]; then
+              fork_default_branch=$(echo "$repo_json" | jq -r ".default_branch" || echo "FETCH_DEFAULT_BRANCH_FAILED")
+              upstream_default_branch=$(gh api --paginate "repos/$upstream_repo" --jq ".default_branch" || echo "FETCH_DEFAULT_BRANCH_FAILED")
+              if [[ "$upstream_default_branch" == "FETCH_DEFAULT_BRANCH_FAILED" ]] || [[ "$fork_default_branch" == "FETCH_DEFAULT_BRANCH_FAILED" ]]; then
+                  echo "::error::$fork_repo : Could not fetch default branch information."
+                  GLOBAL_SYNC_FAILED=true
+              elif [ "$fork_default_branch" != "$upstream_default_branch" ]; then
+                  echo "$fork_repo : Default branch mismatch. Upstream is '$upstream_default_branch', fork is '$fork_default_branch'."
+                  if gh api --method PATCH "repos/$fork_repo" -f default_branch="$upstream_default_branch" --silent; then
+                      echo "$fork_repo : Successfully updated default branch to '$upstream_default_branch'."
+                  else
+                      echo "::error::$fork_repo : Failed to updated default branch to '$upstream_default_branch'."
+                      GLOBAL_SYNC_FAILED=true
+                  fi
+              fi
+              for branch in $fork_branches; do
+                if ! echo "$upstream_branches" | grep -w -q "$branch"; then
+                  echo "$fork_repo : Deleting stale branch '$branch' from fork."
+                  if ! gh api --method DELETE "repos/$fork_repo/git/refs/heads/$branch" --silent; then
+                    echo "::error::$fork_repo : Failed to delete branch '$branch' using API."
+                    GLOBAL_SYNC_FAILED=true
+                  fi
+                fi
+              done
+              echo "$fork_repo : Sync finished"
+            else
+              echo "$fork_repo : Fallback: Performing a full sync using Git force push"
+              repo_dir="$(basename "$fork_repo").git"
+              rm -rf "$repo_dir"
+              (
+                set -e
+                git clone --bare "https://x-access-token:$GH_TOKEN@github.com/$fork_repo.git" "$repo_dir"
+                cd "$repo_dir"
+                git remote add upstream "$upstream_url"
+                git fetch --all --prune --tags --force
+                echo "$fork_repo : Force pushing all upstream branches"
+                git push origin --force --prune "refs/remotes/upstream/*:refs/heads/*"
+                echo "$fork_repo : Force pushing all tags"
+                git push origin --force --tags
+                cd ..
+                rm -rf "$repo_dir"
+              )
+              if [ $? -ne 0 ]; then
+                  echo "::error::$fork_repo : Fallback sync failed."
+                  GLOBAL_SYNC_FAILED=true
+              else
+                  echo "$fork_repo : Fallback sync completed."
+              fi
+              rm -rf "$repo_dir"
+            fi
+          done
+          if [ "$GLOBAL_SYNC_FAILED" = true ]; then
+            echo "::error::One or more repositories encountered errors during the sync process."
+            exit 1
+          fi
+          echo "All forked repositories sync finished."
