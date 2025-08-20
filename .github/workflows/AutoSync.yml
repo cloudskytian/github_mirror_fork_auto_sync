@@ -54,21 +54,25 @@ jobs:
               GLOBAL_SYNC_FAILED=true
               continue
             fi
-            sync_failed=false
-            for branch in $upstream_branches; do
-              echo "$fork_repo : branch : $branch"
-              is_whitelisted=$(echo "$whitelist_branches" | jq --arg branch "$branch" "(. // []) | any(.==\"$branch\")")
-              if [[ "$is_whitelisted" == "true" ]]; then
-                echo "$fork_repo : Skipping branch '$branch' due to whitelist rule."
-                continue
-              fi
-              if ! gh api --method POST "repos/$fork_repo/merge-upstream" -f branch="$branch" --silent; then
-                echo "::error::$fork_repo : API sync failed for branch '$branch'. A fallback to Git force push is required."
-                sync_failed=true
-                break
-              fi
-            done
-            if [ "$sync_failed" = false ]; then
+            clone_fork=false
+            if echo "$repo_json" | jq -e ".size < 1024000" > /dev/null; then
+              clone_fork=true
+            else
+              for branch in $upstream_branches; do
+                echo "$fork_repo : branch : $branch"
+                is_whitelisted=$(echo "$whitelist_branches" | jq --arg branch "$branch" "(. // []) | any(.==\"$branch\")")
+                if [[ "$is_whitelisted" == "true" ]]; then
+                  echo "$fork_repo : Skipping branch '$branch' due to whitelist rule."
+                  continue
+                fi
+                if ! gh api --method POST "repos/$fork_repo/merge-upstream" -f branch="$branch" --silent; then
+                  echo "::error::$fork_repo : API sync failed for branch '$branch'. A fallback to Git force push is required."
+                  clone_fork=true
+                  break
+                fi
+              done
+            fi
+            if [ "$clone_fork" = false ]; then
               fork_default_branch=$(echo "$repo_json" | jq -r ".default_branch" || echo "FETCH_DEFAULT_BRANCH_FAILED")
               upstream_default_branch=$(gh api --paginate "repos/$upstream_repo" --jq ".default_branch" || echo "FETCH_DEFAULT_BRANCH_FAILED")
               if [[ "$upstream_default_branch" == "FETCH_DEFAULT_BRANCH_FAILED" ]] || [[ "$fork_default_branch" == "FETCH_DEFAULT_BRANCH_FAILED" ]]; then
