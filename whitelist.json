@@ -1,4 +1,5 @@
 {
-    "skip_full_repo":[],
+    "subconverter":[],
     "skip_branch_repo":["skip_branch"]
 }
+
